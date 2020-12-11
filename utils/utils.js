@@ -1,9 +1,5 @@
 "use strict";
 
-import {
-    UNBREAKABLE_ROLLBACK_CODE,
-} from "../editor.js";
-
 const INVISIBLE_REGEX = /\u200c/g;
 
 export const MERGE_CODES = {
@@ -46,8 +42,8 @@ export function nodeSize(node) {
 //------------------------------------------------------------------------------
 
 export const DIRECTIONS = {
-    LEFT: 0,
-    RIGHT: 1,
+    LEFT: false,
+    RIGHT: true,
 };
 
 export const closestPath = function* (node) {
@@ -576,12 +572,9 @@ export function mergeNodes(leftNode, rightNode = leftNode.nextSibling) {
     // The given node is visible but cannot accept contents (like a BR). We
     // remove it and return the related merge code.
     if (isVisibleEmpty(leftNode)) {
-        const index = childNodeIndex(leftNode);
-        const restoreLeft = prepareUpdate(leftNode.parentNode, index, DIRECTIONS.RIGHT);
-        const restoreRight = prepareUpdate(leftNode.parentNode, index + 1, DIRECTIONS.LEFT);
+        const restore = prepareUpdate([leftNode, DIRECTIONS.LEFT], [leftNode, DIRECTIONS.RIGHT]);
         leftNode.oRemove();
-        restoreLeft();
-        restoreRight();
+        restore();
         return MERGE_CODES.REMOVED_VISIBLE_NODE;
     }
 
@@ -599,24 +592,16 @@ export function mergeNodes(leftNode, rightNode = leftNode.nextSibling) {
     if (rightIsBlock) {
         // First case, the right side is block content: we have to unwrap that
         // content in the proper location.
-
-        const index = childNodeIndex(rightNode);
-        const restoreOriginLeft = prepareUpdate(rightNode.parentNode, index, DIRECTIONS.RIGHT);
-        const restoreOriginRight = prepareUpdate(rightNode.parentNode, index + 1, DIRECTIONS.LEFT);
-
-        const fragmentEl = document.createDocumentFragment();
-        while (rightNode.firstChild) {
-            fragmentEl.appendChild(rightNode.firstChild);
-        }
-        rightNode.oRemove();
-        restoreOriginLeft();
-        restoreOriginRight();
-
         // If the left side is an inline node, simply unwrap at current location
         // (= after the left side).
         // If the left side is a block, find the right position to unwrap the
         // content inside and reposition cursor the right way.
-        moveMergedNodes(leftNode, fragmentEl, leftIsBlock);
+        const restore = prepareUpdate([rightNode, DIRECTIONS.LEFT], [rightNode, DIRECTIONS.RIGHT]);
+        if (rightNode.childNodes.length) {
+            moveMergedNodes(leftNode, [...rightNode.childNodes], leftIsBlock);
+        }
+        rightNode.oRemove();
+        restore();
     } else {
         // Second case, the right side is inline content.
 
@@ -634,32 +619,25 @@ export function mergeNodes(leftNode, rightNode = leftNode.nextSibling) {
             node = node.nextSibling;
         } while (node && !isBlock(node));
 
-        const index = childNodeIndex(rightNode);
-        const restoreOriginLeft = prepareUpdate(rightNode.parentNode, index, DIRECTIONS.RIGHT);
-        const restoreOriginRight = prepareUpdate(rightNode.parentNode, index + inlineNodes.length, DIRECTIONS.LEFT);
-
-        const fragmentEl = document.createDocumentFragment();
-        inlineNodes.forEach(node => fragmentEl.appendChild(node));
-        restoreOriginLeft();
-        restoreOriginRight();
-
-        moveMergedNodes(leftNode, fragmentEl);
+        const restore = prepareUpdate([inlineNodes[0], DIRECTIONS.LEFT], [inlineNodes[inlineNodes.length - 1], DIRECTIONS.RIGHT]);
+        moveMergedNodes(leftNode, inlineNodes);
+        restore();
     }
 
     return MERGE_CODES.SUCCESS;
 }
 
 /**
- * Moves the given nodes in the given fragment to the given destination element.
+ * Moves the given nodes to the given destination element.
  * That destination element is prepared first and adapted if necessary. The
  * cursor is then placed inside, before the moved elements.
  *
- * @param {Element} destinationEl
- * @param {DocumentFragment} sourceFragment
+ * @param {HTMLElement} destinationEl
+ * @param {Node[]} nodes
  * @param {boolean} [inside=true]
- * @returns {Element} The element where the elements where actually moved.
+ * @returns {HTMLElement} The element where the elements where actually moved.
  */
-export function moveMergedNodes(destinationEl, sourceFragment, inside = true) {
+export function moveMergedNodes(destinationEl, nodes, inside = true) {
     // For table elements, there just cannot be a meaningful move, add them
     // after the table.
     if (['TABLE', 'TBODY', 'THEAD', 'TFOOT', 'TR', 'TH', 'TD'].includes(destinationEl.tagName)) {
@@ -682,15 +660,16 @@ export function moveMergedNodes(destinationEl, sourceFragment, inside = true) {
     const latestChildEl = latestChild(destinationEl);
 
     const restoreDestination = inside
-        ? prepareUpdate(destinationEl, destinationEl.childNodes.length)
-        : prepareUpdate(destinationEl.parentNode, childNodeIndex(destinationEl) + 1);
-    const restoreMovedLeft = prepareUpdate(sourceFragment, 0, DIRECTIONS.LEFT);
-    const restoreMovedRight = prepareUpdate(sourceFragment, sourceFragment.childNodes.length, DIRECTIONS.RIGHT);
+        ? prepareUpdate([destinationEl, destinationEl.childNodes.length])
+        : prepareUpdate([destinationEl, DIRECTIONS.RIGHT]);
+    const restoreMoved = prepareUpdate([nodes[0], DIRECTIONS.LEFT], [nodes[nodes.length - 1], DIRECTIONS.RIGHT]);
 
+    const fragment = document.createDocumentFragment();
+    nodes.forEach(node => fragment.appendChild(node));
     if (inside) {
-        destinationEl.appendChild(sourceFragment);
+        destinationEl.appendChild(fragment);
     } else {
-        destinationEl.after(sourceFragment);
+        destinationEl.after(fragment);
     }
     // FIXME ideally setCursor after restore but restore may remove BR where
     // we want to set the cursor... TODO: find a better way to reposition cursor
@@ -701,8 +680,7 @@ export function moveMergedNodes(destinationEl, sourceFragment, inside = true) {
         setCursorStart(destinationEl);
     }
     restoreDestination();
-    restoreMovedLeft();
-    restoreMovedRight();
+    restoreMoved();
     // FIXME sometimes restore mess up where the cursor was placed by the above
     // code... so we reforce it here...
     if (latestChildEl !== destinationEl || !inside) {
@@ -741,33 +719,40 @@ export function isFakeLineBreak(node) {
 
 /**
  * Any editor command is applied to a selection (collapsed or not). After the
- * command, the content type before that selection and after that selection
- * should be the same (some whitespace should disappear as went from collapsed
+ * command, the content type on the selection boundaries, in both direction,
+ * should be preserved (some whitespace should disappear as went from collapsed
  * to non collapsed, or converted to &nbsp; as went from non collapsed to
  * collapsed, there also <br> to remove/duplicate, etc).
  *
  * This function returns a callback which allows to do that after the command
- * has been done. It also prepares the DOM to receive the command in a way
- * the callback will be able to work on.
+ * has been done.
  *
  * Note: the method has been made generic enough to work with non-collapsed
  * selection but can be used for an unique cursor position.
  *
- * @param {Node} el
- * @param {number} offset
- * @param {number} [direction=DIRECTIONS.BOTH]
+ * @param {...Array.<HTMLElement, number>} pos - series of
+ *     positions where to prepare for an update (the fact the update is done
+ *     on the left or on the right is irrelevant). A pos is given as an array
+ *     (element + offset) or (element + DIRECTIONS.LEFT/DIRECTIONS.RIGHT)
  * @returns {function}
  */
-export function prepareUpdate(el, offset, direction = DIRECTIONS.BOTH) {
-    // Check the state in the given direction starting from the position.
-    const directions = direction === DIRECTIONS.BOTH ? [DIRECTIONS.LEFT, DIRECTIONS.RIGHT] : [direction];
+const directions = [DIRECTIONS.LEFT, DIRECTIONS.RIGHT];
+export function prepareUpdate(pos, ...args) {
+    // Check the state in each direction starting from each position.
     const restoreData = [];
-    for (const direction of directions) {
-        const [state, node] = getState(el, offset, direction);
-        restoreData.push({state: state, node: node, direction: direction});
+    for (pos of arguments) {
+        for (const direction of directions) {
+            let [el, offset] = pos;
+            if (typeof offset !== 'number') {
+                offset = childNodeIndex(el) + (offset === DIRECTIONS.LEFT ? 0 : 1);
+                el = el.parentNode;
+            }
+            const [state, node] = getState(el, offset, direction);
+            restoreData.push({state: state, node: node, direction: direction});
+        }
     }
 
-    // Create the callback that will be able to restore the state in the given
+    // Create the callback that will be able to restore the state in each
     // direction wherever the node in the opposite direction has landed.
     return function restoreStates() {
         for (const data of restoreData) {
@@ -935,12 +920,9 @@ export function enforceWhitespace(el, offset, direction, visible) {
                 // Fine on Firefox but on Chrome, the space is now invisible.
                 // Removing the second BR, the space has to be transformed into
                 // &nbsp; for this case on Chrome.
-                const index = childNodeIndex(node);
-                const restoreLeft = prepareUpdate(node.parentNode, index, DIRECTIONS.RIGHT);
-                const restoreRight = prepareUpdate(node.parentNode, index + 1, DIRECTIONS.LEFT);
+                const restore = prepareUpdate([node, DIRECTIONS.LEFT], [node, DIRECTIONS.RIGHT]);
                 node.remove();
-                restoreLeft();
-                restoreRight();
+                restore();
             }
             break;
         } else if (node.nodeType === Node.TEXT_NODE) {
